@@ -1,0 +1,28 @@
+{
+  "name": "trainerize",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/trainerize/src",
+  "projectType": "library",
+  "tags": [],
+  "targets": {
+    "build": {
+      "executor": "@nx-bun/nx:build",
+      "outputs": ["{options.outputPath}"],
+      "options": {
+        "entrypoints": ["packages/trainerize/src/index.ts"],
+        "outputPath": "dist/trainerize",
+        "tsConfig": "packages/trainerize/tsconfig.lib.json",
+        "smol": false,
+        "bun": true
+      }
+    },
+    "test": {
+      "executor": "@nx-bun/nx:test",
+      "options": {
+        "smol": false,
+        "bail": true,
+        "bun": false
+      }
+    }
+  }
+}

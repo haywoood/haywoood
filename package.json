@@ -1,5 +1,5 @@
 {
-  "name": "@org/source",
+  "name": "haywoood",
   "version": "0.0.0",
   "license": "MIT",
   "scripts": {},
@@ -9,8 +9,8 @@
     "@swc-node/register": "~1.9.1",
     "@swc/core": "~1.5.7",
     "@swc/helpers": "~0.5.11",
+    "@types/bun": "^1.1.13",
     "@types/node": "18.16.9",
-    "bun-types": "latest",
     "nx": "20.0.7",
     "prettier": "^2.6.2",
     "tslib": "^2.3.0",

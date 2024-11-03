@@ -13,7 +13,9 @@
     "importHelpers": true,
     "incremental": true,
     "isolatedModules": true,
-    "lib": ["es2022"],
+    "lib": [
+      "es2022"
+    ],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "noEmitOnError": true,
@@ -30,6 +32,8 @@
     "strict": true,
     "target": "es2022",
     "verbatimModuleSyntax": false,
-    "types": ["bun-types"]
+    "types": [
+      "bun-types"
+    ]
   }
 }

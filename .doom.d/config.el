@@ -71,30 +71,25 @@
 
 (add-to-list 'default-frame-alist '(fullscreen . maximized))
 
-(after! smartparens
-;; Evil-friendly leader keybindings under SPC k
-  (map! :leader
-        :prefix ("k" . "sexp")
-        "s" #'sp-splice-sexp              ;; remove outer parens
-        "r" #'sp-raise-sexp               ;; like SPC k E
-        "j" #'sp-join-sexp                ;; join two sexps
-        "S" #'sp-split-sexp               ;; split one sexp into two
-        "d" #'sp-kill-sexp                ;; kill next expression
-        "D" #'sp-kill-hybrid-sexp         ;; kill sexp and surrounding space
-        "a" #'sp-absorb-sexp              ;; absorb next into current
-        "e" #'sp-end-of-sexp              ;; jump to end of sexp
-        "b" #'sp-beginning-of-sexp        ;; jump to beginning of sexp
-        "n" #'sp-next-sexp                ;; jump to next
-        "p" #'sp-previous-sexp            ;; jump to previous
-        "w" #'sp-wrap-round               ;; wrap with ()
-        "{" #'sp-wrap-curly               ;; wrap with {}
-        "[" #'sp-wrap-square              ;; wrap with []
-        "u" #'sp-unwrap-sexp              ;; remove outer parens
-        "U" #'sp-backward-unwrap-sexp     ;; unwrap from behind
-        "l" #'sp-forward-slurp-sexp       ;; expand to include next
-        "h" #'sp-backward-slurp-sexp      ;; expand backward
-        "L" #'sp-forward-barf-sexp        ;; shrink forward
-        "H" #'sp-backward-barf-sexp))     ;; shrink backward
+(setq evil-move-beyond-eol t)
+
+(map! :leader
+      (:prefix ("k" . "structural")
+               "s" #'sp-forward-slurp-sexp
+               "S" #'sp-backward-slurp-sexp
+               "b" #'sp-forward-barf-sexp
+               "B" #'sp-backward-barf-sexp
+               "E" #'sp-raise-sexp
+               "d" #'sp-kill-sexp
+               "y" #'sp-copy-sexp
+               "t" #'sp-transpose-sexp
+               "c" #'sp-convolute-sexp
+               "w" #'sp-wrap-sexp
+               "u" #'sp-unwrap-sexp
+               "j" #'sp-join-sexp
+               "r" #'sp-rewrap-sexp
+               "x" #'sp-extract-before-sexp
+               "X" #'sp-extract-after-sexp))
 
 ;; accept completion from copilot and fallback to company
 (use-package! copilot
@@ -115,6 +110,11 @@
       :desc "Format buffer with LSP"
       "c f" #'lsp-format-buffer)
 
+(setq display-line-numbers-type nil)
+
+(use-package! gptel
+  :config
+  (setq gptel-api-key ""))
 ;; Whenever you reconfigure a package, make sure to wrap your config in an
 ;; `after!' block, otherwise Doom's defaults may override your settings. E.g.
 ;;

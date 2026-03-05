@@ -1,0 +1,13 @@
+window-theme = system
+theme = Aura
+
+background = #1a1926
+palette = 1=#c4746e
+palette = 2=#8a9a7b
+palette = 9=#c4746e
+palette = 10=#8a9a7b
+font-family = JetBrains Mono
+font-size = 14
+
+# Native macOS tabs — one per worktree
+macos-titlebar-style = tabs

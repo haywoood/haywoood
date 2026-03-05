@@ -1,0 +1,1163 @@
+#!/usr/bin/env bb
+
+(require '[babashka.process :refer [shell process]]
+         '[cheshire.core :as json]
+         '[clojure.string :as str]
+         '[babashka.fs :as fs])
+
+;; --- Config ---
+
+(def config-dir (str (fs/home) "/.config/h"))
+
+(defn load-env []
+  (let [env-file (str config-dir "/.env")]
+    (when (fs/exists? env-file)
+      (->> (slurp env-file)
+           str/split-lines
+           (remove #(or (str/blank? %) (str/starts-with? % "#")))
+           (map #(str/split % #"=" 2))
+           (into {})))))
+
+(def env (load-env))
+
+(defn team-users []
+  (some-> (get env "TEAM_GH_USERS") (str/split #",")))
+
+(defn team-repo []
+  (get env "TEAM_GH_REPO"))
+
+;; --- Helpers ---
+
+(defn gh-json
+  "Run a gh command and parse JSON output."
+  [& args]
+  (let [result (apply shell {:out :string :err :string} "gh" args)]
+    (json/parse-string (:out result) true)))
+
+(defn print-json [data]
+  (println (json/generate-string data {:pretty false})))
+
+;; --- GitHub Activity Helpers ---
+
+(defn parse-since
+  "Parse duration shorthand (1h, 4h, 24h, 7d) or ISO-8601 to java.time.Instant."
+  [s]
+  (if (re-matches #"\d{4}-\d{2}-\d{2}T.*" s)
+    (java.time.Instant/parse s)
+    (let [[_ n unit] (re-matches #"(\d+)(h|d)" s)
+          n (parse-long n)
+          duration (case unit
+                     "h" (java.time.Duration/ofHours n)
+                     "d" (java.time.Duration/ofDays n))]
+      (.minus (java.time.Instant/now) duration))))
+
+(defn pr-number-from-api-url
+  "Extract PR number from GitHub API URL like .../pulls/123."
+  [url]
+  (when url
+    (some-> (re-find #"/pulls?/(\d+)" url) second parse-long)))
+
+(defn ci-status
+  "Summarize statusCheckRollup into :success, :failure, :pending, or :unknown.
+   Handles both CheckRun and StatusContext node types."
+  [rollup]
+  (if (or (nil? rollup) (empty? rollup))
+    :unknown
+    (let [states (map (fn [node]
+                        (let [conclusion (or (:conclusion node) "")
+                              state (or (:state node) (:status node) "")]
+                          (cond
+                            (contains? #{"SUCCESS" "success"} (str/upper-case conclusion)) :success
+                            (contains? #{"FAILURE" "ERROR" "TIMED_OUT" "CANCELLED" "STARTUP_FAILURE" "ACTION_REQUIRED"}
+                                       (str/upper-case conclusion)) :failure
+                            (contains? #{"IN_PROGRESS" "QUEUED" "PENDING" "WAITING" "REQUESTED"}
+                                       (str/upper-case state)) :pending
+                            (= "NEUTRAL" (str/upper-case conclusion)) :success
+                            (= "SKIPPED" (str/upper-case conclusion)) :success
+                            :else :pending)))
+                      rollup)]
+      (cond
+        (some #{:failure} states) :failure
+        (some #{:pending} states) :pending
+        (every? #{:success} states) :success
+        :else :unknown))))
+
+(def ^:private gh-user-cache (atom nil))
+
+(defn current-gh-user
+  "Get current GitHub username (cached)."
+  []
+  (or @gh-user-cache
+      (let [login (str/trim (:out (shell {:out :string} "gh" "api" "user" "-q" ".login")))]
+        (reset! gh-user-cache login)
+        login)))
+
+;; --- Format (JSONL stdin -> ASCII table) ---
+
+(defn read-jsonl
+  "Read JSONL from stdin."
+  []
+  (->> (line-seq (java.io.BufferedReader. *in*))
+       (remove str/blank?)
+       (mapv #(json/parse-string % true))))
+
+(defn markdown-link? [s]
+  (re-matches #"\[.*\]\(.*\)" (str s)))
+
+(defn display-width
+  "Width as rendered — markdown links [text](url) collapse to just the text part."
+  [s]
+  (if-let [[_ label] (re-matches #"\[(.*)\]\(.*\)" s)]
+    (count label)
+    (count s)))
+
+(defn truncate [s max-len]
+  (let [s (str s)]
+    (if (or (markdown-link? s) (<= (count s) max-len))
+      s
+      (str (subs s 0 (- max-len 1)) "…"))))
+
+(defn format-table
+  "Render rows as an ASCII table. opts: --cols=a,b,c to pick columns, --max=N for max col width."
+  [opts]
+  (let [opt-map (->> opts
+                     (filter #(str/starts-with? % "--"))
+                     (map #(str/split (subs % 2) #"=" 2))
+                     (into {}))
+        max-width (if-let [m (get opt-map "max")] (parse-long m) 40)
+        sort-spec (get opt-map "sort")
+        raw-rows (read-jsonl)]
+    (when (seq raw-rows)
+      (let [desc? (and sort-spec (str/starts-with? sort-spec "-"))
+            sort-key (when sort-spec (keyword (if desc? (subs sort-spec 1) sort-spec)))
+            rows (if sort-key
+                   (let [sorted (sort-by (fn [r]
+                                           (let [v (get r sort-key)]
+                                             (if (number? v) v (str v))))
+                                         raw-rows)]
+                     (if desc? (reverse sorted) sorted))
+                   raw-rows)
+            pick-cols (when-let [c (get opt-map "cols")]
+                        (mapv keyword (str/split c #",")))
+            cols (or pick-cols (distinct (mapcat keys rows)))
+            display (fn [v]
+                      (cond
+                        (nil? v) ""
+                        (coll? v) (str/join "," (map str v))
+                        (true? v) "✓"
+                        (false? v) ""
+                        :else (str v)))
+            col-data (into {}
+                           (for [c cols]
+                             [c (mapv #(truncate (display (get % c)) max-width) rows)]))
+            col-widths (into {}
+                             (for [c cols]
+                               [c (apply max (count (name c))
+                                         (map #(display-width %) (get col-data c)))]))
+            pad (fn [s w]
+                  (let [extra (- w (display-width s))]
+                    (str s (apply str (repeat extra " ")))))
+            sep (str "+-" (str/join "-+-" (map #(apply str (repeat (get col-widths %) "-")) cols)) "-+")
+            header (str "| " (str/join " | " (map #(pad (name %) (get col-widths %)) cols)) " |")
+            fmt-row (fn [i]
+                      (str "| " (str/join " | "
+                                          (map #(pad (nth (get col-data %) i)
+                                                     (get col-widths %))
+                                               cols)) " |"))]
+        (println sep)
+        (println header)
+        (println sep)
+        (doseq [i (range (count rows))]
+          (println (fmt-row i)))
+        (println sep)))))
+
+;; --- Commands ---
+
+(defn gh-open
+  "Open PRs for the team (or --mine for just yours)."
+  [opts]
+  (let [mine? (contains? (set opts) "--mine")
+        repo (team-repo)
+        repo-args (if repo ["-R" repo] [])
+        all-prs (apply gh-json (concat ["pr" "list" "--state" "open"
+                                        "--limit" "100"
+                                        "--json" "number,title,author,createdAt,url,headRefName,isDraft,reviewDecision,labels"]
+                                       repo-args))
+        users (if mine?
+                #{(str/trim (:out (shell {:out :string} "gh" "api" "user" "-q" ".login")))}
+                (set (team-users)))
+        filtered (if users
+                   (filter #(contains? users (get-in % [:author :login])) all-prs)
+                   all-prs)
+        now (java.time.Instant/now)
+        rows (->> filtered
+                  (sort-by #(:number %) >)
+                  (map (fn [pr]
+                         (let [created (java.time.Instant/parse (:createdAt pr))
+                               days (.between java.time.temporal.ChronoUnit/DAYS created now)]
+                           {:number (str "[" (:number pr) "](" (:url pr) ")")
+                            :author (get-in pr [:author :login])
+                            :title (:title pr)
+                            :days days
+                            :branch (:headRefName pr)
+                            :draft (:isDraft pr)
+                            :review (:reviewDecision pr)
+                            :created (:createdAt pr)}))))]
+    (doseq [row rows]
+      (print-json row))))
+
+(defn gh-reviews
+  "PRs needing review (requested from team members)."
+  [opts]
+  (let [repo (team-repo)
+        repo-args (if repo ["-R" repo] [])
+        prs (apply gh-json (concat ["pr" "list" "--state" "open"
+                                    "--limit" "100"
+                                    "--json" "number,title,author,url,reviewRequests,reviewDecision"]
+                                   repo-args))
+        users (set (team-users))
+        needs-review (filter (fn [pr]
+                               (some #(contains? users (get-in % [:login]))
+                                     (:reviewRequests pr)))
+                             prs)
+        rows (->> needs-review
+                  (sort-by #(:number %) >)
+                  (map (fn [pr]
+                         {:number (str "[" (:number pr) "](" (:url pr) ")")
+                          :author (get-in pr [:author :login])
+                          :title (:title pr)
+                          :review (:reviewDecision pr)
+                          :requested-from (->> (:reviewRequests pr)
+                                               (map #(get-in % [:login]))
+                                               (filter (set (team-users))))})))]
+    (doseq [row rows]
+      (print-json row))))
+
+(defn gh-mine
+  "Shortcut for gh-open --mine."
+  [opts]
+  (gh-open (conj (vec opts) "--mine")))
+
+(defn- ci-passing?
+  "True if all status checks are successful (SUCCESS/SKIPPED/NEUTRAL)."
+  [pr]
+  (let [checks (:statusCheckRollup pr)]
+    (every? (fn [check]
+              (let [conclusion (or (:conclusion check) "")
+                    state (or (:state check) "")]
+                (or (#{"SUCCESS" "SKIPPED" "NEUTRAL"} conclusion)
+                    (= "SUCCESS" state))))
+            checks)))
+
+(defn- my-open-prs
+  "Fetch my open non-draft PRs with CI and merge status."
+  []
+  (let [repo (team-repo)
+        repo-args (if repo ["-R" repo] [])
+        all-prs (apply gh-json (concat ["pr" "list" "--state" "open"
+                                        "--limit" "100"
+                                        "--json" "number,title,author,url,isDraft,reviewDecision,mergeable,statusCheckRollup,headRefName"]
+                                       repo-args))
+        me (str/trim (:out (shell {:out :string} "gh" "api" "user" "-q" ".login")))]
+    (->> all-prs
+         (filter #(= me (get-in % [:author :login])))
+         (remove :isDraft)
+         (sort-by :number >))))
+
+(defn- pr-problems
+  "Returns a vector of problem strings for a PR, empty if clean."
+  [pr]
+  (let [checks (:statusCheckRollup pr)
+        failed (->> checks
+                    (remove (fn [c]
+                              (let [conclusion (or (:conclusion c) "")
+                                    state (or (:state c) "")]
+                                (or (#{"SUCCESS" "SKIPPED" "NEUTRAL"} conclusion)
+                                    (= "SUCCESS" state)))))
+                    (map #(or (:name %) (:context %))))]
+    (cond-> []
+      (not= "MERGEABLE" (:mergeable pr)) (conj "conflicts")
+      (seq failed) (conj (str "CI: " (str/join ", " failed))))))
+
+(defn gh-approve
+  "Build a Slack message with your PRs needing approval, copy to clipboard."
+  [_opts]
+  (let [prs (remove #(= "APPROVED" (:reviewDecision %)) (my-open-prs))
+        {:keys [ready skipped]} (group-by #(if (seq (pr-problems %)) :skipped :ready) prs)]
+    (if (empty? ready)
+      (println "No PRs ready for approval.")
+      (let [lines (map (fn [pr]
+                         (str "- [#" (:number pr) ": " (:title pr) "](" (:url pr) ")"))
+                       ready)
+            msg (str "yo can you approve these?:\n\n" (str/join "\n" lines))]
+        (shell {:in msg} "pbcopy")
+        (println "Copied to clipboard:\n")
+        (println msg)))
+    (when (seq skipped)
+      (println "\nSkipped (conflicts or failing CI):")
+      (doseq [pr skipped]
+        (println (str "  #" (:number pr) " " (:title pr) " (" (str/join ", " (pr-problems pr)) ")"))))))
+
+(defn gh-todo
+  "Show your PRs that need attention (conflicts, CI failures, changes requested)."
+  [_opts]
+  (let [prs (my-open-prs)
+        needs-attention (->> prs
+                             (map (fn [pr]
+                                    (let [problems (cond-> (pr-problems pr)
+                                                     (= "CHANGES_REQUESTED" (:reviewDecision pr))
+                                                     (conj "changes requested"))]
+                                      (assoc pr ::problems problems))))
+                             (filter #(seq (::problems %))))]
+    (if (empty? needs-attention)
+      (println "All clean! No PRs need attention.")
+      (do (println (str (count needs-attention) " PR(s) need attention:\n"))
+          (doseq [pr needs-attention]
+            (println (str "  #" (:number pr) " " (:title pr)))
+            (println (str "    " (:url pr)))
+            (println (str "    → " (str/join ", " (::problems pr))))
+            (println))))))
+
+(defn gh-slack
+  "Slack-ready summary of team's open PRs."
+  [opts]
+  (let [mine? (contains? (set opts) "--mine")
+        repo (team-repo)
+        repo-args (if repo ["-R" repo] [])
+        all-prs (apply gh-json (concat ["pr" "list" "--state" "open"
+                                        "--limit" "100"
+                                        "--json" "number,title,author,createdAt,url,headRefName,isDraft,reviewDecision"]
+                                       repo-args))
+        users (if mine?
+                #{(str/trim (:out (shell {:out :string} "gh" "api" "user" "-q" ".login")))}
+                (set (team-users)))
+        filtered (if users
+                   (filter #(contains? users (get-in % [:author :login])) all-prs)
+                   all-prs)
+        now (java.time.Instant/now)
+        rows (->> filtered
+                  (sort-by #(:number %) >)
+                  (map (fn [pr]
+                         (let [created (java.time.Instant/parse (:createdAt pr))
+                               days (.between java.time.temporal.ChronoUnit/DAYS created now)]
+                           {:number (:number pr)
+                            :author (get-in pr [:author :login])
+                            :title (:title pr)
+                            :days days
+                            :url (:url pr)
+                            :draft (:isDraft pr)
+                            :review (:reviewDecision pr)}))))]
+    (doseq [row rows]
+      (let [draft (when (:draft row) " DRAFT")
+            review (case (:review row)
+                     "APPROVED" " *approved*"
+                     "CHANGES_REQUESTED" " *changes requested*"
+                     "")
+            link (str "[" (:number row) "](" (:url row) ")")]
+        (println (str link " " (:author row) " — " (:title row) " (" (:days row) "d)" draft review))))))
+
+(defn claude-yolo
+  "Launch claude with --dangerously-skip-permissions."
+  [opts]
+  (apply shell "claude" "--dangerously-skip-permissions" opts))
+
+(defn git-root []
+  (str/trim (:out (shell {:out :string} "git" "rev-parse" "--show-toplevel"))))
+
+(defn wt-path-for [root branch]
+  (let [repo-name (fs/file-name root)]
+    (str (fs/parent root) "/" repo-name "-" branch)))
+
+(def ghostty-bin "/Applications/Ghostty.app/Contents/MacOS/ghostty")
+
+(defn tmux-session-exists? [name]
+  (zero? (:exit (shell {:out :string :err :string :continue true}
+                       "tmux" "has-session" "-t" name))))
+
+(defn wt-create
+  "Create a git worktree and launch Ghostty with tmux (bb dev + claude).
+   Idempotent: reuses existing worktree and reattaches to existing tmux session."
+  [opts]
+  (let [branch (first opts)
+        _ (when-not branch
+            (println "Usage: h wt <branch-name>")
+            (System/exit 1))
+        root (git-root)
+        wt-path (wt-path-for root branch)
+        ;; Detect subdirectory relative to git root (e.g. "petra")
+        cwd (System/getProperty "user.dir")
+        rel-subdir (when (and (str/starts-with? cwd root)
+                              (> (count cwd) (count root)))
+                     (subs cwd (inc (count root))))
+        work-dir (if rel-subdir (str wt-path "/" rel-subdir) wt-path)
+        session-name (str/replace branch #"[/.]" "-")]
+    ;; Create worktree if it doesn't exist
+    (if (fs/exists? wt-path)
+      (println (str "Worktree already exists: " wt-path))
+      (do (println (str "Creating worktree at " wt-path " on branch " branch "..."))
+          (shell "bd" "worktree" "create" wt-path "--branch" branch)))
+    ;; Reattach or create tmux session
+    (if (tmux-session-exists? session-name)
+      (do (println (str "Reattaching to tmux session: " session-name))
+          (process [ghostty-bin (str "--title=" session-name)
+                    "-e" "tmux" "attach-session" "-t" session-name]))
+      (let [tmux-cmd (str "cd " work-dir " && tmux new-session -s " session-name
+                          " \\; send-keys 'bb dev' Enter"
+                          " \\; split-window -h"
+                          " \\; send-keys 'h claude' Enter")]
+        (println (str "Launching tmux in " work-dir))
+        (process [ghostty-bin (str "--title=" session-name)
+                  "-e" "zsh" "-c" tmux-cmd])))))
+
+(defn wt-list
+  "List all git worktrees."
+  [_opts]
+  (let [result (shell {:out :string} "git" "worktree" "list")]
+    (println (:out result))))
+
+(defn wt-rm
+  "Remove a git worktree by branch name or path."
+  [opts]
+  (let [force? (some #{"--force" "-f"} opts)
+        args (remove #{"--force" "-f"} opts)
+        target (first args)
+        _ (when-not target
+            (println "Usage: h wt rm [--force] <branch-name-or-path>")
+            (System/exit 1))
+        ;; If target looks like a path, use it directly; otherwise resolve from branch name
+        wt-path (if (str/includes? target "/")
+                  target
+                  (wt-path-for (git-root) target))]
+    (if (fs/exists? wt-path)
+      (do
+        (println (str "Removing worktree: " wt-path))
+        (apply shell "bd" "worktree" "remove" wt-path (when force? ["--force"]))
+        (println "Done."))
+      (do
+        (println (str "Worktree not found: " wt-path))
+        (println "Run 'h wt ls' to see existing worktrees.")
+        (System/exit 1)))))
+
+(defn wt-cd
+  "Open claude in an existing worktree by branch name."
+  [opts]
+  (let [target (first opts)
+        _ (when-not target
+            (println "Usage: h wt cd <branch-name>")
+            (println "\nAvailable worktrees:")
+            (println (:out (shell {:out :string} "git" "worktree" "list")))
+            (System/exit 1))
+        ;; Parse `git worktree list` to find the path for this branch
+        wt-output (:out (shell {:out :string} "git" "worktree" "list"))
+        lines (str/split-lines wt-output)
+        match (first (filter #(str/includes? % (str "[" target "]")) lines))
+        wt-path (when match (first (str/split (str/trim match) #"\s+")))]
+    (if wt-path
+      (do
+        (println (str "Launching claude in " wt-path))
+        (shell {:dir wt-path} "claude" "--dangerously-skip-permissions"))
+      (do
+        (println (str "No worktree found for branch: " target))
+        (println "\nAvailable worktrees:")
+        (println wt-output)
+        (System/exit 1)))))
+
+(defn wt-prune
+  "Prune stale worktree references."
+  [_opts]
+  (println "Pruning stale worktree references...")
+  (shell "git" "worktree" "prune" "-v")
+  (println "Done."))
+
+(def wt-commands
+  {"ls"    {:fn wt-list   :doc "List all worktrees"}
+   "list"  {:fn wt-list   :doc "List all worktrees"}
+   "cd"    {:fn wt-cd     :doc "Launch claude in an existing worktree"}
+   "rm"    {:fn wt-rm     :doc "Remove a worktree by branch name or path"}
+   "prune" {:fn wt-prune  :doc "Prune stale worktree references"}})
+
+(defn wt-help []
+  (println "h wt - git worktree management\n")
+  (println "Usage:")
+  (println "  h wt <branch>       Create worktree, open Ghostty with tmux (bb dev + claude)")
+  (println "  h wt ls             List all worktrees")
+  (println "  h wt cd <branch>    Launch claude in an existing worktree")
+  (println "  h wt rm <branch>    Remove a worktree (by branch name or path, --force to skip checks)")
+  (println "  h wt prune          Prune stale worktree references")
+  (println "  h wt help           Show this help"))
+
+(defn worktree
+  "Git worktree management: create, list, remove, prune."
+  [opts]
+  (let [subcmd (first opts)]
+    (cond
+      (or (nil? subcmd) (= subcmd "help"))
+      (wt-help)
+
+      (contains? wt-commands subcmd)
+      ((:fn (get wt-commands subcmd)) (rest opts))
+
+      ;; Default: treat as branch name (original behavior)
+      :else
+      (wt-create opts))))
+
+(defn gh-activity
+  "Scan team GitHub activity and output categorized JSONL."
+  [opts]
+  (let [opt-map (->> opts
+                     (filter #(str/starts-with? % "--"))
+                     (map #(str/split (subs % 2) #"=" 2))
+                     (into {}))
+        since-str (get opt-map "since" "24h")
+        since-instant (parse-since since-str)
+        since-iso (str since-instant)
+        me (or (get opt-map "me") (current-gh-user))
+        repo (team-repo)
+        repo-args (if repo ["-R" repo] [])
+        users (set (team-users))
+
+        ;; API call 1: Open PRs with full details
+        prs (apply gh-json (concat ["pr" "list" "--state" "open"
+                                    "--limit" "100"
+                                    "--json" "number,title,author,createdAt,updatedAt,url,headRefName,isDraft,reviewDecision,reviewRequests,reviews,comments,statusCheckRollup,labels"]
+                                   repo-args))
+        ;; Filter to team PRs
+        team-prs (if users
+                   (filter #(contains? users (get-in % [:author :login])) prs)
+                   prs)
+
+        ;; API call 2: Notifications since threshold (query params in URL for GET)
+        notifications (gh-json "api"
+                               (str "/notifications?all=false&per_page=50&since=" since-iso))
+
+        ;; Build a set of PR numbers that have notifications for cross-referencing
+        notified-pr-numbers (into #{}
+                                  (keep #(pr-number-from-api-url (get-in % [:subject :url])))
+                                  notifications)
+
+        now (java.time.Instant/now)
+
+        ;; Category 1: needs-my-review — PRs where I'm a requested reviewer
+        needs-my-review (->> team-prs
+                             (filter (fn [pr]
+                                       (some #(= me (get-in % [:login]))
+                                             (:reviewRequests pr))))
+                             (map (fn [pr]
+                                    {:category "needs-my-review"
+                                     :number (:number pr)
+                                     :title (:title pr)
+                                     :author (get-in pr [:author :login])
+                                     :url (:url pr)
+                                     :updated (:updatedAt pr)})))
+
+        ;; Category 2: new-activity-on-mine — comments/reviews on my PRs since threshold
+        my-prs (filter #(= me (get-in % [:author :login])) team-prs)
+        new-activity-on-mine (->> my-prs
+                                  (filter (fn [pr]
+                                            (let [updated (java.time.Instant/parse (:updatedAt pr))
+                                                  has-recent-update (.isAfter updated since-instant)
+                                                  has-notification (contains? notified-pr-numbers (:number pr))
+                                                  recent-comments (->> (:comments pr)
+                                                                       (filter (fn [c]
+                                                                                 (and (:createdAt c)
+                                                                                      (.isAfter (java.time.Instant/parse (:createdAt c)) since-instant)
+                                                                                      (not= me (get-in c [:author :login]))))))]
+                                              (or has-notification (seq recent-comments)))))
+                                  (map (fn [pr]
+                                         {:category "new-activity-on-mine"
+                                          :number (:number pr)
+                                          :title (:title pr)
+                                          :url (:url pr)
+                                          :updated (:updatedAt pr)
+                                          :comment-count (count (filter (fn [c]
+                                                                          (and (:createdAt c)
+                                                                               (.isAfter (java.time.Instant/parse (:createdAt c)) since-instant)
+                                                                               (not= me (get-in c [:author :login]))))
+                                                                        (:comments pr)))})))
+
+        ;; Category 3: ready-to-merge — approved + all CI green
+        ready-to-merge (->> team-prs
+                            (filter (fn [pr]
+                                      (and (= "APPROVED" (:reviewDecision pr))
+                                           (= :success (ci-status (:statusCheckRollup pr)))
+                                           (not (:isDraft pr)))))
+                            (map (fn [pr]
+                                   {:category "ready-to-merge"
+                                    :number (:number pr)
+                                    :title (:title pr)
+                                    :author (get-in pr [:author :login])
+                                    :url (:url pr)})))
+
+        ;; Category 4: ci-failure — team PRs with failing checks
+        ci-failure (->> team-prs
+                        (filter (fn [pr]
+                                  (and (= :failure (ci-status (:statusCheckRollup pr)))
+                                       (not (:isDraft pr)))))
+                        (map (fn [pr]
+                               {:category "ci-failure"
+                                :number (:number pr)
+                                :title (:title pr)
+                                :author (get-in pr [:author :login])
+                                :url (:url pr)})))
+
+        ;; Category 5: stale — team PRs idle >7 days (excluding drafts)
+        seven-days-ago (.minus now (java.time.Duration/ofDays 7))
+        stale (->> team-prs
+                   (filter (fn [pr]
+                             (and (not (:isDraft pr))
+                                  (let [updated (java.time.Instant/parse (:updatedAt pr))]
+                                    (.isBefore updated seven-days-ago)))))
+                   (map (fn [pr]
+                          (let [updated (java.time.Instant/parse (:updatedAt pr))
+                                idle-days (.between java.time.temporal.ChronoUnit/DAYS updated now)]
+                            {:category "stale"
+                             :number (:number pr)
+                             :title (:title pr)
+                             :author (get-in pr [:author :login])
+                             :url (:url pr)
+                             :idle-days idle-days}))))
+
+        ;; Deduplicate: a PR in needs-my-review shouldn't also show in new-activity
+        review-numbers (into #{} (map :number) needs-my-review)
+        new-activity-on-mine (remove #(contains? review-numbers (:number %)) new-activity-on-mine)
+
+        ;; A PR in ready-to-merge or ci-failure shouldn't also show in stale
+        active-numbers (into #{} (map :number) (concat ready-to-merge ci-failure))
+        stale (remove #(contains? active-numbers (:number %)) stale)
+
+        all-items (concat needs-my-review new-activity-on-mine ready-to-merge ci-failure stale)]
+    (doseq [item all-items]
+      (print-json item))))
+
+;; --- Figma ---
+
+(defn figma-token []
+  (or (System/getenv "FIGMA_TOKEN")
+      (get env "FIGMA_TOKEN")
+      (do (println "No FIGMA_TOKEN set in env or ~/.config/h/.env")
+          (System/exit 1))))
+
+(defn parse-figma-url
+  "Extract fileKey and nodeId from a Figma URL."
+  [url]
+  (let [;; figma.com/design/:fileKey/...?node-id=X-Y
+        m (re-find #"figma\.com/design/([^/]+).*[?&]node-id=([^&]+)" url)]
+    (when m
+      {:file-key (nth m 1)
+       :node-id  (str/replace (nth m 2) "-" ":")})))
+
+(defn figma-fetch-nodes
+  "Fetch node tree from Figma REST API."
+  [file-key node-id]
+  (let [url    (str "https://api.figma.com/v1/files/" file-key "/nodes?ids=" node-id)
+        result (shell {:out :string :err :string}
+                      "curl" "-s" "-H" (str "X-Figma-Token: " (figma-token)) url)
+        data   (json/parse-string (:out result) true)]
+    (when-let [err (:err data)]
+      (println (str "Figma API error: " err " (status " (:status data) ")"))
+      (System/exit 1))
+    (when-not (:nodes data)
+      (println "Figma API returned no nodes")
+      (System/exit 1))
+    data))
+
+(defn figma-fetch-variables
+  "Fetch local variables from Figma file. Returns {var-id {:name :collection}} or nil."
+  [file-key]
+  (try
+    (let [url    (str "https://api.figma.com/v1/files/" file-key "/variables/local")
+          result (shell {:out :string :err :string}
+                        "curl" "-s" "-H" (str "X-Figma-Token: " (figma-token)) url)
+          data   (json/parse-string (:out result) true)]
+      (cond
+        (:error data)
+        (do (println (str "  (" (:message data) ")")) nil)
+
+        (get-in data [:meta :variables])
+        (let [vars  (get-in data [:meta :variables])
+              colls (get-in data [:meta :variableCollections])]
+          (into {}
+                (map (fn [[k v]]
+                       [(str "VariableID:" (name k))
+                        {:name (:name v)
+                         :collection (get-in colls [(keyword (:variableCollectionId v)) :name])}])
+                     vars)))
+
+        :else nil))
+    (catch Exception _e nil)))
+
+(defn figma-resolve-var
+  "Resolve a boundVariable entry to a variable name string, or nil."
+  [var-map entry]
+  (when (and var-map (map? entry) (= (:type entry) "VARIABLE_ALIAS"))
+    (get-in var-map [(:id entry) :name])))
+
+(defn figma-resolve-instance
+  "Resolve INSTANCE node to {:set-name :variant-props :description :icon-name}."
+  [{:keys [components component-sets]} node]
+  (let [cid  (:componentId node)
+        comp (get components (keyword cid))
+        sid  (:componentSetId comp)
+        cset (when sid (get component-sets (keyword sid)))
+        set-name (or (:name cset) (:name comp) (:name node))]
+    {:set-name    set-name
+     :variant-props (:name comp)
+     :description (or (:description cset) (:description comp))
+     :icon-name   (when (and (:description cset)
+                             (not (str/starts-with? (or (:description cset) "") "[")))
+                    ;; Icon component sets have short keyword descriptions
+                    set-name)}))
+
+(defn figma-color->hex [{:keys [r g b]}]
+  (format "#%02x%02x%02x" (int (* r 255)) (int (* g 255)) (int (* b 255))))
+
+(defn figma-fill [node]
+  (some->> (:fills node)
+           (filter #(and (= (:type %) "SOLID") (:visible % true)))
+           first :color figma-color->hex))
+
+(defn figma-stroke [node]
+  (some->> (:strokes node)
+           (filter #(and (= (:type %) "SOLID") (:visible % true)))
+           first :color figma-color->hex))
+
+(defn figma-border-css
+  "Generate border CSS, using individual stroke weights when available."
+  [node]
+  (let [color (figma-stroke node)]
+    (when color
+      (if-let [isw (:individualStrokeWeights node)]
+        ;; Directional borders
+        (let [sides [["top" (:top isw 0)] ["right" (:right isw 0)]
+                     ["bottom" (:bottom isw 0)] ["left" (:left isw 0)]]
+              active (filter (fn [[_ w]] (and w (pos? w))) sides)]
+          (if (and (= (count active) 4)
+                   (apply = (map second active)))
+            ;; All sides equal → uniform border
+            {"border" (str (int (second (first active))) "px solid " color)}
+            ;; Individual sides
+            (into {} (map (fn [[side w]]
+                            [(str "border-" side) (str (int w) "px solid " color)])
+                          active))))
+        ;; Fallback to uniform strokeWeight
+        (let [sw (:strokeWeight node 0)]
+          (when (pos? sw)
+            {"border" (str (int sw) "px solid " color)}))))))
+
+(defn figma-token-attrs
+  "Build data-tokens value from boundVariables. Uses var-map for names when available."
+  [var-map node]
+  (when-let [bv (:boundVariables node)]
+    (let [resolve-one (fn [entry]
+                        (or (figma-resolve-var var-map entry)
+                            (when (and (map? entry) (= (:type entry) "VARIABLE_ALIAS")) "token")))
+          prop-map {:fills "fill" :strokes "stroke" :textRangeFills "color"
+                    :itemSpacing "gap" :paddingTop "pad-t" :paddingRight "pad-r"
+                    :paddingBottom "pad-b" :paddingLeft "pad-l"
+                    :strokeWeight "border-w" :rectangleCornerRadii "radius"
+                    :individualStrokeWeights "border-w"}
+          tokens (into (sorted-map)
+                       (keep (fn [[k v]]
+                               (let [css-prop (get prop-map k (name k))]
+                                 (cond
+                                   (and (map? v) (:type v))
+                                   (when-let [n (resolve-one v)] [css-prop n])
+
+                                   (sequential? v)
+                                   (let [names (keep resolve-one v)]
+                                     (when (seq names) [css-prop (first names)]))
+
+                                   (map? v)
+                                   (let [names (->> (vals v) (keep resolve-one) distinct)]
+                                     (when (seq names) [css-prop (first names)])))))
+                             bv))]
+      (when (seq tokens)
+        (str/join " " (map (fn [[k v]] (str k ":" v)) tokens))))))
+
+(defn figma-style-attr
+  "Build data-style value from node's style references."
+  [styles-map node]
+  (when-let [st (:styles node)]
+    (let [entries (keep (fn [[k v]]
+                          (when-let [info (get styles-map (keyword (str v)))]
+                            (str (name k) ":" (:name info))))
+                        st)]
+      (when (seq entries)
+        (str/join " " entries)))))
+
+(defn figma-data-attrs
+  "Build data-* attribute string for a node."
+  [ctx node]
+  (let [inst   (when (= (:type node) "INSTANCE")
+                 (let [{:keys [set-name variant-props]} (figma-resolve-instance ctx node)]
+                   (str set-name
+                        (when (and variant-props (not= variant-props set-name))
+                          (str " | " variant-props)))))
+        style  (figma-style-attr (:styles-map ctx) node)
+        tokens (figma-token-attrs (:var-map ctx) node)]
+    (str (when inst   (str " data-component=\"" inst "\""))
+         (when style  (str " data-style=\"" style "\""))
+         (when tokens (str " data-tokens=\"" tokens "\"")))))
+
+(defn figma-layout [node]
+  (when-let [mode (:layoutMode node)]
+    (let [align-map {"MIN" "flex-start" "MAX" "flex-end" "CENTER" "center" "SPACE_BETWEEN" "space-between"}
+          css (cond-> {"display" "flex"
+                       "flex-direction" (if (= mode "HORIZONTAL") "row" "column")}
+                (pos? (or (:itemSpacing node) 0))
+                (assoc "gap" (str (int (:itemSpacing node)) "px"))
+
+                (let [pt (:paddingTop node 0) pr (:paddingRight node 0)
+                      pb (:paddingBottom node 0) pl (:paddingLeft node 0)]
+                  (some pos? [pt pr pb pl]))
+                (assoc "padding"
+                       (let [pt (int (:paddingTop node 0)) pr (int (:paddingRight node 0))
+                             pb (int (:paddingBottom node 0)) pl (int (:paddingLeft node 0))]
+                         (cond
+                           (= pt pb pr pl) (str pt "px")
+                           (and (= pt pb) (= pl pr)) (str pt "px " pl "px")
+                           :else (str pt "px " pr "px " pb "px " pl "px"))))
+
+                (and (:counterAxisAlignItems node)
+                     (not= (:counterAxisAlignItems node) "MIN"))
+                (assoc "align-items" (get align-map (:counterAxisAlignItems node)
+                                          (str/lower-case (:counterAxisAlignItems node))))
+
+                (and (:primaryAxisAlignItems node)
+                     (not= (:primaryAxisAlignItems node) "MIN"))
+                (assoc "justify-content" (get align-map (:primaryAxisAlignItems node)
+                                              (str/lower-case (:primaryAxisAlignItems node)))))]
+      css)))
+
+(defn figma-text-css [node]
+  (when-let [s (:style node)]
+    (cond-> {}
+      (:fontSize s)    (assoc "font-size" (str (int (:fontSize s)) "px"))
+      (:fontWeight s)  (assoc "font-weight" (str (int (:fontWeight s))))
+      (:lineHeightPx s) (assoc "line-height" (str (int (:lineHeightPx s)) "px")))))
+
+(defn figma-sizing [node]
+  (let [bb (:absoluteBoundingBox node {})]
+    (cond-> {}
+      (= (:layoutSizingHorizontal node) "FIXED")
+      (assoc "width" (str (int (:width bb)) "px"))
+      (= (:layoutSizingHorizontal node) "FILL")
+      (assoc "flex" "1")
+      (= (:layoutSizingVertical node) "FIXED")
+      (assoc "height" (str (int (:height bb)) "px"))
+      (= (:layoutSizingVertical node) "FILL")
+      (assoc "flex" "1"))))
+
+(defn css-str [m]
+  (when (seq m)
+    (str " style=\"" (str/join "; " (map (fn [[k v]] (str k ": " v)) m)) "\"")))
+
+(defn slug [name]
+  (-> (str/lower-case name) (str/replace " " "-") (str/replace "/" "-")))
+
+(defn figma-render
+  "Render a Figma node tree to compressed HTML."
+  [node indent ctx]
+  (when-not (false? (:visible node))
+    (let [pad (apply str (repeat indent "  "))
+          t   (:type node)
+          nm  (:name node "")
+          da  (figma-data-attrs ctx node)]
+      (cond
+        ;; Text → span
+        (= t "TEXT")
+        (let [css (merge (figma-text-css node)
+                         (when-let [c (figma-fill node)] {"color" c}))]
+          (str pad "<span" (css-str css) da ">" (:characters node) "</span>\n"))
+
+        ;; Vector/icon → comment
+        (#{"VECTOR" "BOOLEAN_OPERATION" "STAR" "LINE" "ELLIPSE" "REGULAR_POLYGON"} t)
+        (str pad "<!-- icon: " nm " -->\n")
+
+        ;; Everything else → div with children
+        :else
+        (let [css (merge (figma-layout node)
+                         (figma-sizing node)
+                         (when-let [bg (figma-fill node)]
+                           (when (not= bg "#ffffff") {"background" bg}))
+                         (figma-border-css node)
+                         (when-let [cr (:cornerRadius node)]
+                           (when (pos? cr) {"border-radius" (str (int cr) "px")}))
+                         (when (:clipsContent node) {"overflow" "hidden"}))
+              tag (slug nm)
+              children (:children node [])]
+          (if (empty? children)
+            (str pad "<div class=\"" tag "\"" (css-str css) da ">\n" pad "</div>\n")
+            (str pad "<div class=\"" tag "\"" (css-str css) da ">\n"
+                 (apply str (keep #(figma-render % (inc indent) ctx) children))
+                 pad "</div>\n")))))))
+
+(defn figma-fetch-screenshot
+  "Fetch a rendered screenshot URL from Figma images API."
+  [file-key node-id]
+  (let [url    (str "https://api.figma.com/v1/images/" file-key
+                    "?ids=" node-id "&format=png&scale=2")
+        result (shell {:out :string :err :string}
+                      "curl" "-s" "-H" (str "X-Figma-Token: " (figma-token)) url)
+        data   (json/parse-string (:out result) true)]
+    (get-in data [:images (keyword node-id)])))
+
+(defn figma-download-screenshot
+  "Download screenshot PNG to a path."
+  [url path]
+  (shell {:out :string :err :string} "curl" "-s" "-o" path url)
+  path)
+
+(defn figma-collect-meta
+  "Walk node tree and collect component names, details, and interactive elements."
+  [node ctx]
+  (let [components (atom (sorted-set))
+        component-details (atom [])
+        interactive (atom [])
+        walk (fn walk [n]
+               (when-not (false? (:visible n))
+                 (when (= (:type n) "INSTANCE")
+                   (let [{:keys [set-name variant-props description]}
+                         (figma-resolve-instance ctx n)]
+                     (swap! components conj set-name)
+                     (swap! component-details conj
+                            {:name (:name n) :set-name set-name
+                             :variant-props variant-props
+                             :description (when (and description (seq description))
+                                            (subs description 0 (min 120 (count description))))})))
+                 (when (seq (:interactions n))
+                   (let [triggers (->> (:interactions n)
+                                       (map #(get-in % [:trigger :type]))
+                                       (str/join ", "))]
+                     (swap! interactive conj
+                            {:name (:name n) :triggers triggers})))
+                 (doseq [c (:children n [])]
+                   (walk c))))]
+    (walk node)
+    {:components @components
+     :component-details @component-details
+     :interactive @interactive}))
+
+(defn figma-tree-outline
+  "Generate an indented tree outline of the node structure."
+  [node indent ctx]
+  (when-not (false? (:visible node))
+    (let [pad    (apply str (repeat indent "  "))
+          t      (:type node)
+          nm     (:name node "")
+          suffix (cond
+                   (= t "TEXT")
+                   (let [style-name (some-> (:styles-map ctx)
+                                            (get (keyword (str (get-in node [:styles :text]))))
+                                            :name)
+                         chars (:characters node "")]
+                     (str (when style-name (str " {" style-name "}"))
+                          " \"" (subs chars 0 (min 40 (count chars))) "\""))
+
+                   (= t "INSTANCE")
+                   (let [{:keys [set-name variant-props]} (figma-resolve-instance ctx node)]
+                     (str " [" set-name
+                          (when (and variant-props (not= variant-props set-name))
+                            (str " | " variant-props))
+                          "]"))
+
+                   :else "")]
+      (str pad nm suffix "\n"
+           (when-not (#{"TEXT" "VECTOR" "BOOLEAN_OPERATION" "STAR" "LINE"
+                        "ELLIPSE" "REGULAR_POLYGON"} t)
+             (apply str (keep #(figma-tree-outline % (inc indent) ctx)
+                              (:children node []))))))))
+
+(defn figma-collect-var-ids
+  "Walk node tree and collect all unique variable IDs with their bound property."
+  [node]
+  (let [var-ids (atom {})
+        walk (fn walk [n]
+               (when-let [bv (:boundVariables n)]
+                 (doseq [[prop val] bv]
+                   (let [prop-name (name prop)
+                         extract (fn [entry]
+                                   (when (and (map? entry) (= (:type entry) "VARIABLE_ALIAS"))
+                                     (swap! var-ids update (:id entry)
+                                            (fn [prev] (conj (or prev #{}) prop-name)))))]
+                     (cond
+                       (and (map? val) (:type val)) (extract val)
+                       (sequential? val) (doseq [item val] (extract item))
+                       (map? val) (doseq [[_ v] val] (extract v))))))
+               (doseq [c (:children n [])]
+                 (walk c)))]
+    (walk node)
+    @var-ids))
+
+(defn figma-load-var-file
+  "Load a cached variables JSON file. Returns var-map {string-id {:name ...}} or nil."
+  [path]
+  (try
+    (let [raw (json/parse-string (slurp path) false)]
+      ;; Keep string keys (variable IDs), keywordize value maps
+      (let [vm (into {} (map (fn [[k v]] [k {:name (get v "name")
+                                             :collection (get v "collection")}])
+                             raw))]
+        (println (str "Loaded " (count vm) " variables from " path))
+        vm))
+    (catch Exception e
+      (println (str "Warning: could not load var-file: " (.getMessage e)))
+      nil)))
+
+(defn figma-vars-cmd
+  "Fetch design token variables from a Figma file and save to JSON."
+  [opts]
+  (let [url (first opts)]
+    (when-not url
+      (println "Usage: h figma-vars <figma-url> [--out=vars.json]")
+      (println "  Fetches variable names and saves to JSON for use with h figma --var-file=")
+      (println "  Requires file_variables:read scope on your Figma token.")
+      (System/exit 1))
+    (let [{:keys [file-key]} (parse-figma-url url)]
+      (when-not file-key
+        (println "Could not parse Figma URL.")
+        (System/exit 1))
+      (let [out-file (or (some #(when (str/starts-with? % "--out=") (subs % 6)) opts)
+                         "scratch/figma-vars.json")]
+        (print (str "Fetching variables from " file-key "... ")) (flush)
+        (let [vm (figma-fetch-variables file-key)]
+          (if vm
+            (do (spit out-file (json/generate-string vm {:pretty true}))
+                (println (str (count vm) " variables → " out-file)))
+            (do (println "Failed. Ensure your token has file_variables:read scope.")
+                (System/exit 1))))))))
+
+(defn figma-cmd
+  "Fetch a Figma node and compress to HTML+CSS."
+  [opts]
+  (let [url (first opts)]
+    (when-not url
+      (println "Usage: h figma <figma-url> [--out=dir] [--vars] [--var-file=path]")
+      (println "  Writes: dir/design.html, dir/screenshot.png, dir/tree.txt")
+      (println "  --vars           Fetch design token variable names (extra API call)")
+      (println "  --var-file=path  Load cached variables from JSON (from h figma-vars)")
+      (System/exit 1))
+    (let [{:keys [file-key node-id]} (parse-figma-url url)]
+      (when-not file-key
+        (println "Could not parse Figma URL. Expected: figma.com/design/:key/...?node-id=X-Y")
+        (System/exit 1))
+      (let [out-dir    (or (some #(when (str/starts-with? % "--out=") (subs % 6)) opts)
+                           "scratch/figma")
+            from-file  (some #(when (str/starts-with? % "--file=") (subs % 7)) opts)
+            var-file   (some #(when (str/starts-with? % "--var-file=") (subs % 11)) opts)
+            fetch-vars? (some #(= % "--vars") opts)
+            _          (fs/create-dirs out-dir)
+            data       (if from-file
+                         (do (println (str "Reading from " from-file "..."))
+                             (json/parse-string (slurp from-file) true))
+                         (do (println (str "Fetching " file-key " node " node-id "..."))
+                             (figma-fetch-nodes file-key node-id)))
+            var-map    (cond
+                         var-file
+                         (figma-load-var-file var-file)
+
+                         (and fetch-vars? (not from-file))
+                         (do (print "Fetching variables... ") (flush)
+                             (let [vm (figma-fetch-variables file-key)]
+                               (println (if vm (str (count vm) " resolved") "none (remote library?)"))
+                               vm))
+
+                         :else nil)
+            output     (StringBuilder.)]
+
+        ;; Process each node
+        (doseq [[nid ndata] (:nodes data)]
+          (let [doc  (:document ndata)
+                ctx  {:components     (:components ndata)
+                      :component-sets (:componentSets ndata)
+                      :styles-map     (:styles ndata)
+                      :var-map        var-map}
+                meta (figma-collect-meta doc ctx)
+                tree (figma-tree-outline doc 0 ctx)]
+
+            ;; Header comment
+            (.append output (str "<!-- " (str/replace (str nid) #"^:" "") ": " (:name doc) " -->\n"))
+
+            ;; Component details
+            (when (seq (:component-details meta))
+              (let [unique (distinct (map #(select-keys % [:set-name :variant-props])
+                                          (:component-details meta)))]
+                (.append output "<!-- components:\n")
+                (doseq [{:keys [set-name variant-props]} unique]
+                  (.append output (str "  " set-name
+                                       (when (and variant-props (not= variant-props set-name))
+                                         (str " (" variant-props ")"))
+                                       "\n")))
+                (.append output "-->\n")))
+
+            ;; Interactive elements
+            (when (seq (:interactive meta))
+              (.append output "<!-- interactive:\n")
+              (doseq [{:keys [name triggers]} (:interactive meta)]
+                (.append output (str "  " name " (" triggers ")\n")))
+              (.append output "-->\n"))
+
+            (.append output "\n")
+
+            ;; Tree outline → separate file
+            (spit (str out-dir "/tree.txt") tree)
+
+            ;; HTML body
+            (.append output (or (figma-render doc 0 ctx) ""))))
+
+        ;; Write HTML
+        (let [html-out (str output)
+              raw-size (count (json/generate-string data))
+              comp-size (count html-out)]
+          (spit (str out-dir "/design.html") html-out)
+          (println (str raw-size " → " comp-size " bytes ("
+                        (format "%.1f" (* 100.0 (/ comp-size raw-size))) "%)")))
+
+        ;; Fetch screenshot (skip if from local file)
+        (when-not from-file
+          (print "Fetching screenshot... ")
+          (flush)
+          (let [img-url (figma-fetch-screenshot file-key node-id)]
+            (if img-url
+              (do (figma-download-screenshot img-url (str out-dir "/screenshot.png"))
+                  (println "done"))
+              (println "failed (no image URL)"))))
+
+        (println (str "→ " out-dir "/"))))))
+
+;; --- Dispatch ---
+
+(def commands
+  {"gh-open"     {:fn gh-open      :doc "Team's open PRs as JSONL (--mine for yours)"}
+   "gh-mine"     {:fn gh-mine      :doc "Your open PRs as JSONL"}
+   "gh-approve"  {:fn gh-approve   :doc "Copy Slack msg asking for PR approvals"}
+   "gh-todo"     {:fn gh-todo      :doc "Your PRs needing attention (conflicts, CI, changes)"}
+   "gh-reviews"  {:fn gh-reviews   :doc "PRs requesting review from team"}
+   "gh-slack"    {:fn gh-slack     :doc "Slack-ready team PR summary (--mine)"}
+   "gh-activity" {:fn gh-activity  :doc "Team activity digest as JSONL (--since=24h --me=user)"}
+   "format"      {:fn format-table :doc "Pipe JSONL to ASCII table (--cols=a,b --max=N)"}
+   "claude"      {:fn claude-yolo  :doc "Run claude --dangerously-skip-permissions"}
+   "wt"          {:fn worktree     :doc "Worktree mgmt: create, ls, rm, prune"}
+   "figma"       {:fn figma-cmd    :doc "Fetch Figma node → compressed HTML+CSS"}
+   "figma-vars"  {:fn figma-vars-cmd :doc "Fetch+cache Figma design token variables"}
+   "help"        {:fn nil          :doc "Show available commands"}})
+
+(defn print-help []
+  (println "h - personal dev CLI\n")
+  (println "Commands:")
+  (doseq [[name {:keys [doc]}] (sort commands)]
+    (printf "  %-14s %s%n" name doc))
+  (println (str "\nConfig: " config-dir "/.env")))
+
+(let [[cmd & opts] *command-line-args*]
+  (cond
+    (or (nil? cmd) (= cmd "help"))
+    (print-help)
+
+    (contains? commands cmd)
+    ((:fn (get commands cmd)) opts)
+
+    :else
+    (do (println (str "Unknown command: " cmd))
+        (print-help)
+        (System/exit 1))))
